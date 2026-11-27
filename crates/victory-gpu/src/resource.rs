@@ -1343,6 +1343,78 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// (vi-3080) The largest side, in texels, of the host copy of a placed
+/// block-compressed texture the title fills (`VICTORY_TEXTURE_MAX_DIM`, 4 to
+/// 16384; unset or 0: no cap). After Evan-Lowry's cap in PastiiJay/klbf-lab
+/// (fccf50f, 19919db, 52f2384; GPL-3.0), here on the held-levels base: such a
+/// copy begins at the first of the title's levels no larger than this, as a
+/// copy of a texture whose views start later does ([`base_level`]), so its
+/// upload, its views and its replacement all go the way they already go.
+#[cfg(windows)]
+fn texture_max_dim() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n @ 4..=16384) => {
+                tracing::info!(max_dim = n, "texture cap: host copies of placed block-compressed textures at most this size");
+                Some(n)
+            }
+            _ => {
+                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 4 to 16384");
+                None
+            }
+        }
+    })
+}
+
+/// Flat screen images (loading screens, menus) keep their full size under the
+/// cap (`VICTORY_TEXTURE_MAX_DIM_KEEP_UI=0`: capped too): a side that is not a
+/// power of two, or a short mip chain (3 levels or fewer, or 3 or more fewer
+/// than a full chain down to the smaller side). World textures are powers of
+/// two with full chains. (KLBF 19919db and 52f2384.)
+fn looks_like_ui(width: u64, height: u32, mip_levels: u16) -> bool {
+    let (w, h) = (width, u64::from(height));
+    let full = u64::from(64 - w.min(h).max(1).leading_zeros());
+    !w.is_power_of_two() || !h.is_power_of_two() || mip_levels <= 3 || u64::from(mip_levels) + 2 < full
+}
+
+#[cfg(windows)]
+fn keep_ui() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAX_DIM_KEEP_UI").is_none_or(|v| v != "0"))
+}
+
+/// Host copies the cap made smaller, since the start (for the log).
+#[cfg(windows)]
+static CAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The level the host copy of `desc` begins at least under the cap (0: no
+/// cap, or a texture it leaves alone). Only with held levels, whose machinery
+/// it rides on, and only for block-compressed formats: the title's colour and
+/// normal maps, not data it reads texel by texel.
+#[cfg(windows)]
+fn cap_base(desc: &ResourceDesc) -> u32 {
+    let Some(max) = texture_max_dim() else {
+        return 0;
+    };
+    if !held_only()
+        || !element(desc.format).is_some_and(|(_, block)| block == 4)
+        || keep_ui() && looks_like_ui(desc.width, desc.height, desc.mip_levels)
+    {
+        return 0;
+    }
+    let mut level = 0u32;
+    while level + 1 < u32::from(desc.mip_levels) && (desc.width >> level).max(u64::from(desc.height) >> level) > max {
+        level += 1;
+    }
+    if level == 0 {
+        return 0;
+    }
+    base_level(desc, level)
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
@@ -1431,7 +1503,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // (vi-3080) Not below the texture cap's level: a view of a level the cap
+    // dropped would otherwise replace the copy with the same one, forever.
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(cap_base(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1710,6 +1784,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
+            }
+        }
+        // (vi-3080) The texture cap ([`cap_base`]): no lower than its level.
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && alias_of(this).is_none() {
+            let cap = cap_base(&r.desc);
+            if cap > base {
+                base = cap;
+                let n = CAPPED.fetch_add(1, Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(capped = n, "texture cap: host copies made smaller since the start");
+                }
             }
         }
         let texture = match texture {
@@ -4880,5 +4965,20 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod vi_3080_cap_tests {
+    #[test]
+    fn screen_images_are_told_from_world_textures() {
+        use super::looks_like_ui;
+        assert!(looks_like_ui(1920, 1080, 1));
+        assert!(looks_like_ui(1280, 720, 11));
+        assert!(looks_like_ui(2048, 2048, 3));
+        assert!(looks_like_ui(4096, 4096, 6));
+        assert!(!looks_like_ui(2048, 2048, 12));
+        assert!(!looks_like_ui(4096, 2048, 12));
+        assert!(!looks_like_ui(1024, 512, 9));
     }
 }

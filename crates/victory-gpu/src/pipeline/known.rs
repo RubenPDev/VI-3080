@@ -200,9 +200,13 @@ pub fn keys(dir: &Path) -> Vec<String> {
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
+    // (vi-3080) The device first: making it tells the translator what the
+    // card is (its widest wave, `VICTORY_FAST_FLOAT`), which the translation's
+    // key holds.
+    let host = crate::host::host();
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
+    if let Some(host) = host {
         h.update(&host.driver().to_le_bytes());
     }
     h.finalize().to_hex()[..16].to_owned()
@@ -219,6 +223,12 @@ pub fn use_translations(dir: PathBuf) {
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+    // (vi-3080) The device before the first translation: a compute program
+    // (or a vertex and pixel pair) was translated before anything had made
+    // it, as for a card of no known wave width and none of the translator's
+    // host forms, so the first pipeline of every batch of 40 got shaders the
+    // game never asks for.
+    let _ = crate::host::host();
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };

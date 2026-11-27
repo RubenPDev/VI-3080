@@ -949,7 +949,22 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            // (vi-3080) `VICTORY_FAST_FLOAT=1`: the console's float
+            // instructions written the short way on any card (which of them:
+            // `VICTORY_RDNA_FLOAT`). The 0-times-anything-is-0 multiply that
+            // nearly every multiply of the title's shaders is costs four more
+            // operations a multiply spelled out (two compares, an or, a
+            // select: a quarter of the operations of its heaviest mesh
+            // programs, profile 14), and one compare where a factor may be
+            // an infinity or no number the short way, exact but for the sign
+            // of a zero. Its own cache of translations: switching it back
+            // needs no new warm-up of what was warmed without it.
+            let fast = std::env::var_os("VICTORY_FAST_FLOAT").is_some_and(|v| v == "1");
+            let rdna = amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64;
+            if fast && !rdna {
+                tracing::info!(bits = victory_shader::emit::rdna_float(), "float instructions written the short way (VICTORY_FAST_FLOAT=1)");
+            }
+            victory_shader::emit::set_host_rdna(rdna || fast);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -1271,6 +1286,12 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     /// The title calls that may record into the list ([`HostList::title_call`]).
     title_calls: std::sync::atomic::AtomicU64,
+    /// (vi-3080) As the last barrier on every shader write was recorded: the
+    /// title calls and the indirect executions then, each plus one (0: none
+    /// since the list was reset) ([`HostList::vi_barrier_redundant`]).
+    vi_barrier_mark: [std::sync::atomic::AtomicU64; 2],
+    /// (vi-3080) Indirect executions asked for (not title calls).
+    vi_indirect_calls: std::sync::atomic::AtomicU64,
     /// The run of indirect executions the list's last one belongs to
     /// ([`crate::indirect::merge`]), and its execution if it is held back.
     indirect_run: Mutex<Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>>,
@@ -2374,6 +2395,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// (vi-3080) What a host library's commands in the list use, kept until
+    /// the list is reset ([`HostList::vi_keep`]).
+    vi_shared: Vec<Box<dyn std::any::Any + Send>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -2844,7 +2868,12 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// (vi-3080) 18-21: the settles for title memory read that 15-17 do not
+/// name: a step reading the destination of a copy done in its list
+/// ([`place::read_by`]), and [`card_steps::copied_read_kind`]'s three (a
+/// refresh of another host copy of a card copy's destination, a step of ours
+/// over it, a movie plane).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2896,7 +2925,11 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, true).or_else(|| {
+        let kind = card_steps::copied_read_kind(&copies, runs)?;
+        LATE_STATS[19 + kind].fetch_add(1, Ordering::Relaxed);
+        Some(WHY_READ)
+    })
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3138,7 +3171,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    let read = !placed.is_empty() && place::read_by(runs, placed);
+    if read && count {
+        LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+    }
+    read.then_some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3734,7 +3771,8 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}; vi-3080: a copy done in its list then read {:.1}, a refresh of a copy the card copied into {:.1}, \
+         a step of ours over a card copy {:.1}, a movie plane over one {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -3749,6 +3787,10 @@ fn late_line(frames: f64) {
         s[15],
         s[16],
         s[17],
+        s[18],
+        s[19],
+        s[20],
+        s[21],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],
@@ -4266,6 +4308,8 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 title_calls: std::sync::atomic::AtomicU64::new(0),
+                vi_barrier_mark: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+                vi_indirect_calls: std::sync::atomic::AtomicU64::new(0),
                 indirect_run: Mutex::default(),
                 holding: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
@@ -5651,6 +5695,7 @@ impl Host {
             let id = run.take_upscale();
             if id != 0 {
                 crate::streamline::submitted(id);
+                crate::framegen::submitted(id);
             }
             let id = run.take_hudless();
             if id != 0 {
@@ -6570,6 +6615,7 @@ impl HostList {
         // Before the epoch moves on below.
         let left_open = self.still_left_open();
         self.changed_something();
+        self.vi_barrier_mark[0].store(0, Ordering::Relaxed);
         self.holding.store(false, Ordering::Relaxed);
         *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
@@ -6639,6 +6685,47 @@ impl HostList {
     /// The title calls recorded into the list so far.
     pub(crate) fn title_calls(&self) -> u64 {
         self.title_calls.load(Ordering::Relaxed)
+    }
+
+    /// (vi-3080) An indirect execution was asked for: work, for
+    /// [`HostList::vi_barrier_redundant`].
+    pub(crate) fn vi_indirect_called(&self) {
+        self.vi_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (vi-3080) Whether a barrier on every shader write would follow the
+    /// last one with nothing recorded between them: no title call that
+    /// records (draws, dispatches, copies, clears, ours at its place) and no
+    /// indirect execution since, in this recording. Such a barrier orders
+    /// nothing the one before did not (`VICTORY_BARRIER_ELIDE=0` records it
+    /// all the same). Asked before the barrier's own call is counted.
+    pub(crate) fn vi_barrier_redundant(&self) -> bool {
+        // 0: off; 1 (unset): as above; `all`, for measuring only: every one
+        // is left out (shaders may then read what others have not finished
+        // writing: flicker, wrong colours).
+        static MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_BARRIER_ELIDE").as_deref() {
+            Ok("0") => 0,
+            Ok("all") => {
+                tracing::warn!("VICTORY_BARRIER_ELIDE=all: every barrier on every shader write the title asks for is left out (a measurement: expect flicker)");
+                2
+            }
+            _ => 1,
+        });
+        if mode != 1 {
+            return mode == 2;
+        }
+        let mark = self.vi_barrier_mark[0].load(Ordering::Relaxed);
+        mark != 0
+            && mark == self.title_calls() + 1
+            && self.vi_barrier_mark[1].load(Ordering::Relaxed) == self.vi_indirect_calls.load(Ordering::Relaxed) + 1
+    }
+
+    /// (vi-3080) A barrier on every shader write was just recorded, its own
+    /// calls counted.
+    pub(crate) fn vi_barrier_recorded(&self) {
+        self.vi_barrier_mark[1].store(self.vi_indirect_calls.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        self.vi_barrier_mark[0].store(self.title_calls() + 1, Ordering::Relaxed);
     }
 
     /// Records the indirect execution held back, if one is: before
@@ -7603,6 +7690,12 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    /// (vi-3080) Keeps `object` until the list is reset, which is after its
+    /// last submission has run (AMD's frame generation, `crate::framegen`).
+    pub(crate) fn vi_keep(&self, object: Box<dyn std::any::Any + Send>) {
+        self.deferred().vi_shared.push(object);
     }
 
     /// The list recorded upscaling `id` (`crate::streamline`).
@@ -9236,6 +9329,9 @@ struct Presenter {
     panel: panel::Panel,
     /// The F1 settings menu.
     menu: menu::Menu,
+    /// (vi-3080) The swap chain is AMD's, for its frame generation
+    /// (`crate::framegen`).
+    fsr_framegen: bool,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9318,6 +9414,10 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::indirect::merge::line(frames);
+        crate::draw::indirect_steps_line(frames);
+        crate::draw::vi_bind::line(frames);
+        crate::list::vi_barrier_line(frames);
+        crate::shadow::vi_window_line();
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
@@ -9703,7 +9803,7 @@ impl Meter {
         let Some(caption) = &self.caption else { return };
         // With frame generation showing more frames than are rendered, both rates.
         let text = match crate::streamline::shown_per_frame() {
-            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{}", crate::framegen::caption()),
             per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
         };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
@@ -9775,7 +9875,7 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(width, height, format, frame) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -9800,9 +9900,15 @@ impl Host {
             settle_now(WHY_SYNC);
             crate::streamline::resizing();
             // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
+            let resize = || unsafe {
                 p.swap_chain
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            };
+            // (AMD's swap chain: its frame generation drained around it.)
+            let resized = if p.fsr_framegen {
+                crate::framegen::resize(frame, width, height, format.0, resize)
+            } else {
+                resize()
             };
             match resized {
                 Ok(()) => {
@@ -10028,7 +10134,12 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if p.fsr_framegen {
+                let hudless = crate::streamline::fsr_hudless(texture);
+                let _ = crate::framegen::present(&p.swap_chain, frame, hudless.as_ref());
+            } else {
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -10056,6 +10167,7 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
+        frame: u64,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
@@ -10078,6 +10190,20 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            // (vi-3080) With AMD's frame generation: its swap chain, made on our
+            // queue (`crate::framegen`).
+            let fsr = if crate::framegen::requested() {
+                crate::framegen::swap_chain(hwnd, &desc, &factory, &self.queue, &self.device, frame)
+            } else {
+                None
+            };
+            let fsr_framegen = fsr.is_some();
+            if fsr_framegen {
+                crate::streamline::fsr_hudless_wanted();
+            }
+            let swap_chain = match fsr {
+                Some(swap_chain) => swap_chain,
+                None => {
             // With frame generation, through Streamline's factory proxy and
             // on its queue proxy: the swap chain is its proxy.
             let proxied = crate::streamline::swap_chain_factory(&factory).map(|(proxy, queue)| {
@@ -10106,6 +10232,9 @@ impl Host {
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
             };
+            swap_chain
+                }
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -10122,6 +10251,7 @@ impl Host {
                 composer: None,
                 panel: panel::Panel::new(),
                 menu: menu::Menu::new(),
+                fsr_framegen,
             })
         }
     }

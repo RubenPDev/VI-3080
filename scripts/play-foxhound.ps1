@@ -119,8 +119,12 @@ $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else
 $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
-$settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+# (vi-3080) A launcher that calls this one with its own VICTORY_MENU_PLAY and VICTORY_MENU_ARGS in -More
+# (scripts\play-3080.ps1) is the one the menu starts again, so its settings stay after "SAVE AND RESTART NOW".
+if (-not $More.ContainsKey('VICTORY_MENU_PLAY')) {
+    $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
+    $settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+}
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
