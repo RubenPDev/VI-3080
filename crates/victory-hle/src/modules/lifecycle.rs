@@ -206,6 +206,11 @@ fn mouse_motion(reference: &mut Option<(i32, i32)>, point: (i32, i32), warped: O
     delta
 }
 
+/// (vi-3080) The name of the title's window (the frame-rate caption
+/// `victory-gpu` writes after it starts with the same name).
+const WINDOW_TITLE_W: PCWSTR = w!("RG4M3R - R4G3");
+const WINDOW_TITLE_A: PCSTR = windows_sys::core::s!("RG4M3R - R4G3");
+
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -221,6 +226,8 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    // (vi-3080) The title's own window is named ours.
+    let name = if parent.is_null() && !name.is_null() { WINDOW_TITLE_W } else { name };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -247,6 +254,8 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    // (vi-3080) The title's own window is named ours.
+    let name = if parent.is_null() && !name.is_null() { WINDOW_TITLE_A } else { name };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
