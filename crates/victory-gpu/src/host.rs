@@ -842,6 +842,9 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+/// (vi-3080) The window's name, in front of the frame-rate caption.
+const WINDOW_TITLE: &str = "RG4M3R - R4G3";
+
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -9801,13 +9804,16 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
-        let Some(caption) = &self.caption else { return };
-        // With frame generation showing more frames than are rendered, both rates.
+        if self.caption.is_none() {
+            return;
+        }
+        // With frame generation showing more frames than are rendered, both
+        // rates. (vi-3080) Under this fork's name, not the title's window text.
         let text = match crate::streamline::shown_per_frame() {
-            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{}", crate::framegen::caption()),
-            per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+            1 => format!("{WINDOW_TITLE} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{}", crate::framegen::caption()),
+            per => format!("{WINDOW_TITLE} | {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
         };
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -10757,7 +10763,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("RG4M3R - R4G3"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
