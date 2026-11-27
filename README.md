@@ -50,7 +50,7 @@ The upstream README follows further down, under
 Open a **normal** PowerShell window, not as administrator, and run:
 
 ```powershell
-git clone --branch vi-3080 <this repository's URL> "$HOME\VI-3080"
+git clone --branch vi-3080 https://github.com/RubenPDev/VI-3080 "$HOME\VI-3080"
 cd "$HOME\VI-3080"
 powershell -ExecutionPolicy Bypass -File scripts\setup-3080.ps1 -GameDir 'D:\XboxGames\GameFiles'
 ```
@@ -91,7 +91,7 @@ the game stutters badly for a long time.
 <summary>Setting up by hand instead</summary>
 
 ```powershell
-git clone --branch vi-3080 <this repository's URL> "$HOME\VI-3080"
+git clone --branch vi-3080 https://github.com/RubenPDev/VI-3080 "$HOME\VI-3080"
 cd "$HOME\VI-3080"
 copy victory.example.toml victory.toml   # set game_dir, cache_dir and data_dir: all outside this folder
 .\Get-NVIDIA-DLSS.cmd                     # NVIDIA's files into nvidia-sdk\ (about 70 MB)
@@ -222,6 +222,8 @@ These switches are worth knowing for `-More`:
 | `VICTORY_RT_SKIN='1'` | run the ray-tracing-only skinning passes again (left out by default) |
 | `VICTORY_SKIP_RT_HAIR='1'` | also leave out the ray-tracing-only hair geometry |
 | `VICTORY_BARRIER_ELIDE='0'` | record every redundant "wait for earlier shader writes" step |
+| `VICTORY_VI_TIMING='1'` | time every step of binding and of indirect draws, for the `vi-3080 binding` and `vi-3080 indirect steps` log lines (off by default: it costs CPU time) |
+| `VICTORY_MERGE_PROBE='1'` | log what differs between back-to-back draws of one pipeline (update 21's measurement) |
 
 To build the diagnostics build (10–15 minutes):
 
@@ -270,7 +272,9 @@ PC this was tuned on.
 - **Redundant waits left out** (`list.rs`, `host.rs`). A "wait for earlier
   shader writes" step is dropped when nothing was recorded since the last one.
 - **More numbers in the log** (`draw.rs`, `list/thin.rs`, `host.rs`). Lines
-  starting with `vi-3080` show where the CPU time goes:
+  starting with `vi-3080` show where the CPU time goes (the binding and
+  indirect-step timings only with `VICTORY_VI_TIMING=1`, since they cost CPU
+  time themselves):
   - the steps of indirect draws
   - the parts of binding
   - how long batches of draws wait to be translated
@@ -336,28 +340,64 @@ copy beside the Streamline files fixes it, and the setup script adds it.
 
 ## How it runs
 
-On the RTX 3080 10 GB, Ryzen 7 9800X3D and 32 GB PC, Series X profile at
-1440p with DLSS Balanced:
+Measured on the PC this was tuned on: **RTX 3080 10 GB, Ryzen 7 9800X3D,
+32 GB RAM, Windows 11, Resizable BAR on**, with the launcher's defaults (fast
+shaders, the game's memory through Resizable BAR, pipelines built ahead).
+"Real fps" is frames the game renders; frame generation adds one generated
+frame between every two real ones.
 
-- **About 15–23 fps.** It reaches the mid-20s on open roads and drops to about
-  13 in dense downtown traffic.
-- **The graphics card is the limit.** The game's own draws take about 45 ms
-  of GPU time a frame, spread over roughly 12,000 small draws. Leaving out all
-  ~750 "wait" steps per frame barely changed that (GPU about 84% → 80% busy).
-  DLSS Performance doesn't help either, because most of that time doesn't
-  depend on resolution.
+| Setup | Real fps | On screen with AMD frame generation |
+|---|---|---|
+| Series X, 1440p, DLSS Quality | 14–22 (median about 17; the slowest tenth of seconds about 12) | about 28–44 |
+| Series X, 4K, DLSS Balanced | about 13–15 | about twice that (not measured) |
+| Series S, 1440p, DLSS Quality (softer textures, lower resolution inside) | 16–26 (median about 21) | about twice that (not measured) |
+
+What to expect:
+
+- **It's playable with frame generation, not smooth.** Motion looks like 30–40
+  fps, but the controls respond at the real frame rate (about 17), and
+  generated frames show artifacts around fast-moving edges. F6 switches frame
+  generation off and on to compare.
+- **Short hitches when something appears for the first time.** The first time
+  the game uses a pipeline (often in a new area), a frame can wait up to
+  100 ms for it (`-PipelineWait`). When the game closes, the launcher builds
+  the pipelines that session met, so places you've been get smoother each
+  time you play.
+- **The graphics card is the limit, and it's spread thin.** The card is busy
+  80–90% of every frame, running about 9,000 small draws across about 1,500
+  different shaders; no single shader takes more than about 3 ms. Lower DLSS
+  modes help less than you'd think, because most of that time doesn't depend
+  on resolution. Balanced is worth trying over Quality.
+- **Video memory is tight on a 10 GB card.** Textures fill the card. Distant
+  textures can pop in or appear late, and `-TextureCap 1024` trades some
+  sharpness for room.
 - **There is no real ray tracing.** The title's ray-tracing passes are left
   out, and the layer estimates indirect light and reflections instead. Night
   scenes hide most of the difference; inside buildings it shows more.
-- **Known issues:**
-  - stutter until pipelines are warmed up
-  - occasional drops when new areas load
-  - some odd or pink textures
-  - visual artifacts here and there
-- **Frame generation.** NVIDIA's needs an RTX 40 or newer, so this uses AMD's.
-  With 17–20 real fps, motion looks smoother, but the controls still respond
-  at the real frame rate and generated frames show artifacts, mostly around
-  fast-moving edges. F6 compares it in a second.
+- **Resizable BAR matters.** It was one of the biggest single gains. Check it
+  in NVIDIA Control Panel → System Information ("Resizable BAR: Yes"); without
+  it, start with `-NoBarWindows`.
+
+How it got here (1440p, Series X):
+
+| Step | Real fps |
+|---|---|
+| Starting point (base fork, tuned launcher) | 13–16 |
+| Fast shaders (update 15) | about 13–15 at 4K Balanced, where the base fork managed about 10 at 4K Performance |
+| Game memory through Resizable BAR, matching warm-up (update 16) | 13–28 |
+| Shorter pipeline waits, pipelines built after each session (update 17) | 14–22, median about 17, fewer and shorter hitches |
+
+Tried and left out, so nobody has to try them again on a similar PC:
+
+| Tried | Result |
+|---|---|
+| Joining back-to-back draws into one command | Not possible: about 4,000 of 5,400 such draws a frame read different textures or buffers |
+| `VICTORY_WC_BAR=1` (the game's buffers through Resizable BAR) | Slower (15.8 median), and the sunlight flashed on and off: results the game reads back stayed on the card |
+| `VICTORY_PORT_CONSTANTS=1` (renderer port #1) | Slower (14.1 median): less CPU work, but the card reads the game's constants over PCIe |
+| Running the game's compute work on a second queue | Nothing to move: the game sends all its work on one queue |
+| `-TextureCap 1024` alone | No faster: textures still fill the card |
+| More card room for vertex and constant memory (`-RoomForGeometry`, update 14's test) | Steadier and faster, but visibly softer textures; left as an option |
+| Series S profile | About 30% faster, from lower resolution and softer textures |
 
 ## Troubleshooting
 
