@@ -9416,6 +9416,7 @@ impl Meter {
         crate::indirect::merge::line(frames);
         crate::draw::indirect_steps_line(frames);
         crate::draw::vi_bind::line(frames);
+        crate::draw::vi_merge::line(frames);
         crate::list::vi_barrier_line(frames);
         crate::shadow::vi_window_line();
         crate::shadow::exact_line(frames);

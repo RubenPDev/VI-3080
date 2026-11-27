@@ -560,6 +560,8 @@ pub(crate) struct State {
     recording: u64,
     /// See [`State::rebinds`].
     rebinds: [u64; 2],
+    /// (vi-3080) What the last indirect execution bound ([`vi_merge`]).
+    vi_prev: Option<vi_merge::Bound>,
 }
 
 impl Drop for State {
@@ -5160,6 +5162,12 @@ impl State {
             ));
             return false;
         }
+        if vi_merge::on() {
+            let now = self.vi_bound(p, kind);
+            if let Some(before) = self.vi_prev.replace(now) {
+                vi_merge::weigh(&before, self.vi_prev.as_ref().expect("just set"));
+            }
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
@@ -5419,6 +5427,169 @@ impl State {
     }
 }
 
+impl State {
+    /// (vi-3080) What an indirect execution of `kind` with the host pipeline
+    /// `p` binds, for [`vi_merge`]: the title's pipeline and heaps, its root
+    /// arguments, and the record words of every table entry the pipeline's
+    /// shaders name.
+    fn vi_bound(&self, p: &HostPipeline, kind: u32) -> vi_merge::Bound {
+        let roots = self.roots_ref(kind == 2).clone();
+        let mut entries = Vec::new();
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                if let Some(Root::Table(table)) = roots.get(usize::from(u.slot)) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    let words = crate::descriptor::record_at(handle);
+                    entries.push((u.slot, u.table_offset_dwords, u.kind == ResourceType::Cbv, words));
+                }
+            }
+        }
+        entries.sort_unstable_by_key(|e| (e.0, e.1));
+        entries.dedup_by_key(|e| (e.0, e.1));
+        vi_merge::Bound { pipeline: self.pipeline, kind, heaps: self.heaps, roots, entries }
+    }
+}
+
+/// (vi-3080) Whether back-to-back indirect executions could be one: for each
+/// execution after another of the same title pipeline and kind on the same
+/// list, what differs in what they bind. `VICTORY_MERGE_PROBE=1` turns the
+/// probe on. The layer can join executions only when nothing differs
+/// ([`crate::indirect::merge`], "0 could join" in every frame line so far,
+/// 6,500 of 9,000 executions "after the title changed their binding"); one
+/// `ExecuteIndirect` can also change root constants and one root view per
+/// record, so executions that differ only in those, or only in which
+/// constant buffer a table names, could be joined that way.
+///
+/// Measured (update 21, 1440p gameplay): of ~5,400 such executions a frame,
+/// ~4,000 differ in more than one table entry, about 20 in root constants
+/// only and about 10 in constant buffers only: they are different work, and
+/// joining them is no way to fewer commands. Off by default since
+/// (`VICTORY_MERGE_PROBE=1` weighs them again).
+pub(crate) mod vi_merge {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_PROBE").is_some_and(|v| v == "1"))
+    }
+
+    pub(crate) struct Bound {
+        pub(crate) pipeline: usize,
+        pub(crate) kind: u32,
+        pub(crate) heaps: [usize; 2],
+        pub(super) roots: Vec<super::Root>,
+        /// Root slot, offset in dwords, whether a constant buffer, record words.
+        pub(crate) entries: Vec<(u8, u32, bool, Option<[u32; 3]>)>,
+    }
+
+    /// Of executions after one of the same pipeline and kind: nothing
+    /// differs; only table addresses (the entries the shaders read hold the
+    /// same); only root constants; only root views; only constant buffers in
+    /// tables (with root constants or views, or not); one other entry; more;
+    /// other heaps. Then: executions weighed, of another pipeline or kind than
+    /// the one before.
+    const SAME: usize = 0;
+    const MOVED: usize = 1;
+    const CONSTANTS: usize = 2;
+    const VIEWS: usize = 3;
+    const CBVS: usize = 4;
+    const ONE: usize = 5;
+    const MORE: usize = 6;
+    const HEAPS: usize = 7;
+    const WEIGHED: usize = 8;
+    const OTHER: usize = 9;
+    /// Of the CBV kind: in how many entries (1, 2, more).
+    const CBV_ONE: usize = 10;
+    const CBV_TWO: usize = 11;
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+    pub(crate) fn weigh(before: &Bound, now: &Bound) {
+        let add = |i: usize| COUNTS[i].fetch_add(1, Ordering::Relaxed);
+        add(WEIGHED);
+        if before.pipeline != now.pipeline || before.kind != now.kind {
+            add(OTHER);
+            return;
+        }
+        if before.heaps != now.heaps {
+            add(HEAPS);
+            return;
+        }
+        use super::Root;
+        let n = before.roots.len().max(now.roots.len());
+        let (mut constants, mut views, mut tables) = (false, false, false);
+        let none = Root::None;
+        for i in 0..n {
+            let (a, b) = (before.roots.get(i).unwrap_or(&none), now.roots.get(i).unwrap_or(&none));
+            if a == b {
+                continue;
+            }
+            match (a, b) {
+                (Root::Constants(_), Root::Constants(_)) => constants = true,
+                (Root::View(_), Root::View(_)) => views = true,
+                (Root::Table(_), Root::Table(_)) => tables = true,
+                _ => {
+                    add(MORE);
+                    return;
+                }
+            }
+        }
+        let (mut cbvs, mut others) = (0usize, 0usize);
+        if tables {
+            if before.entries.len() != now.entries.len() {
+                add(MORE);
+                return;
+            }
+            for (a, b) in before.entries.iter().zip(&now.entries) {
+                if (a.0, a.1) != (b.0, b.1) {
+                    add(MORE);
+                    return;
+                }
+                if a.3 != b.3 {
+                    if a.2 {
+                        cbvs += 1;
+                    } else {
+                        others += 1;
+                    }
+                }
+            }
+        }
+        let what = match (constants, views, tables, cbvs, others) {
+            (false, false, false, _, _) => SAME,
+            (false, false, true, 0, 0) => MOVED,
+            (true, false, _, 0, 0) => CONSTANTS,
+            (false, true, _, 0, 0) => VIEWS,
+            (_, _, true, c, 0) if c > 0 => CBVS,
+            (false, false, true, 0, 1) => ONE,
+            _ => MORE,
+        };
+        add(what);
+        if what == CBVS && cbvs <= 2 {
+            add(if cbvs == 1 { CBV_ONE } else { CBV_TWO });
+        }
+    }
+
+    /// For the frame line, per frame of the last `frames`.
+    pub(crate) fn line(frames: f64) {
+        let n: [f64; 12] = std::array::from_fn(|i| COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if n[WEIGHED] == 0.0 {
+            return;
+        }
+        let cbv_more = (n[CBVS] - n[CBV_ONE] - n[CBV_TWO]).max(0.0);
+        tracing::info!(
+            "vi-3080 indirect executions after one on the same list, per frame: {:.0} weighed, {:.0} of another pipeline or kind; \
+             of the same pipeline: {:.0} bind the same, {:.0} the same entries from tables at other addresses, {:.0} differ in \
+             root constants only, {:.0} in root views only, {:.0} in constant buffers of their tables only ({:.0} in one, \
+             {:.0} in two, {:.0} in more; root constants or views may differ too), {:.0} in one other table entry, {:.0} in \
+             more, {:.0} in heaps (VICTORY_MERGE_PROBE=1)",
+            n[WEIGHED], n[OTHER], n[SAME], n[MOVED], n[CONSTANTS], n[VIEWS], n[CBVS], n[CBV_ONE], n[CBV_TWO], cbv_more,
+            n[ONE], n[MORE], n[HEAPS]
+        );
+    }
+}
+
 /// (vi-3080) The steps of an indirect execution, timed: finding what it
 /// needs (pipeline, copies, signature), refreshing the arguments' host copy,
 /// the clamp pass (or its batch), joining it to the run before, binding the
@@ -5449,14 +5620,21 @@ impl IndirectClock {
         Self { last: std::time::Instant::now(), parts: [0; STEPS] }
     }
 
-    /// What passed since the last mark goes to `step`.
+    /// What passed since the last mark goes to `step` (with
+    /// `VICTORY_VI_TIMING=1` only: [`vi_bind::on`]).
     fn mark(&mut self, step: usize) {
+        if !vi_bind::on() {
+            return;
+        }
         let now = std::time::Instant::now();
         self.parts[step] += now.duration_since(self.last).as_nanos() as u64;
         self.last = now;
     }
 
     fn finish(mut self) {
+        if !vi_bind::on() {
+            return;
+        }
         self.mark(STEP_REST);
         let all: u64 = self.parts.iter().sum();
         let slow = all >= SLOW_US * 1000;
@@ -5534,16 +5712,29 @@ pub(crate) mod vi_bind {
     static SUM_NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static SUM_N: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
+    /// Whether the parts of binding and of indirect executions are timed
+    /// (`VICTORY_VI_TIMING=1`; off by default since update 23: a clock read
+    /// at every step of every bind, some 200,000 a frame, cost the
+    /// translating threads time for numbers only a tuning session needs).
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_VI_TIMING").is_some_and(|v| v == "1"))
+    }
+
     /// A bind begins now.
     pub(super) fn start() -> Instant {
         let now = Instant::now();
-        LAST.set(Some(now));
+        if on() {
+            LAST.set(Some(now));
+        }
         now
     }
 
     /// Timing goes on from now (after a bind, for the rest of a draw).
     pub(super) fn resume() {
-        LAST.set(Some(Instant::now()));
+        if on() {
+            LAST.set(Some(Instant::now()));
+        }
     }
 
     /// Timing stops until the next bind.
@@ -5566,6 +5757,9 @@ pub(crate) mod vi_bind {
     }
 
     pub(super) fn count(what: usize, n: u64) {
+        if !on() {
+            return;
+        }
         N.set({
             let mut a = N.get();
             a[what] += n;
@@ -5576,6 +5770,9 @@ pub(crate) mod vi_bind {
     /// A bind that began at `began` is done: counted, and every 64 binds
     /// the thread's sums go to the shared ones.
     pub(super) fn done(began: Instant) {
+        if !on() {
+            return;
+        }
         let ns = began.elapsed().as_nanos() as u64;
         let mut n = N.get();
         n[BINDS] += 1;
