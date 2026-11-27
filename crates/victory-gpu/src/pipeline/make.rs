@@ -123,7 +123,61 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if rt_skin_left_out(shaders) {
+        return Some("poses meshes only for the ray-tracing structures, whose builder is off (VICTORY_RT_SKIN=1 runs it), left out");
+    }
+    if rt_hair_left_out(shaders) {
+        return Some("hair geometry only for the ray-tracing structures, whose builder is off (asked by VICTORY_SKIP_RT_HAIR=1), left out");
+    }
     None
+}
+
+/// The title's `bvh_skinning` programs (vi-3080; after edsuuu/VI-BR-PORT
+/// `pipeline.rs` ab4571df and 1556de82, GPL-3.0-or-later): they pose every
+/// animated mesh, and its motion, once more, only for the ray-tracing
+/// structures. With the structure builder off nothing reads what they write,
+/// yet on a 32-lane NVIDIA card they were the largest share of the card's
+/// time in the opening cutscene (6.8 fps with them, 10.9 without, RTX 4060
+/// Ti) and they write through a view of the title's whole 174 MB heap, which
+/// the submissions behind them wait for.
+///
+/// Known by entry point: all 30 named `CSComputeSkinning*` in the title's
+/// shader file are `bvh_skinning`'s. The picture's own skinning is
+/// `CS_PedStandardSkinning*`, `CS_PosOnlyLodSkinning*` and the cloth's
+/// `computeclothSkinning`, which run. `VICTORY_RT_SKIN=1` runs them all.
+fn rt_skin_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
+    }) && named(shaders, b"CSComputeSkinning")
+}
+
+/// `bvh_skinning_smh`'s `CSGenerateHairVB`: the hair's geometry made for the
+/// ray-tracing structures (about 8 % of the card's time in the opening
+/// cutscene on VI-BR-PORT's RTX 4060 Ti). Opt-in while it is tried
+/// (`VICTORY_SKIP_RT_HAIR=1`), and only with the structure builder off.
+fn rt_hair_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_SKIP_RT_HAIR").is_some_and(|v| v == "1")
+    }) && named(shaders, b"CSGenerateHairVB")
+}
+
+#[cfg(test)]
+mod vi_3080_tests {
+    /// The names the two switches look for, against the picture's own
+    /// skinning (which must run).
+    #[test]
+    fn ray_only_skinning_is_known_by_name() {
+        let has = |bytes: &[u8], name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+        assert!(has(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0..", b"CSComputeSkinning"));
+        assert!(!has(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0..", b"CSComputeSkinning"));
+        assert!(!has(b"..\0CS_PosOnlyLodSkinning_0_Wrapped\0..", b"CSComputeSkinning"));
+        assert!(!has(b"computeclothSkinning", b"CSComputeSkinning"));
+        assert!(has(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0..", b"CSGenerateHairVB"));
+    }
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold

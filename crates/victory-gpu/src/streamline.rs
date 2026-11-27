@@ -140,6 +140,9 @@ pub struct Upscale {
     /// and composition mask, output: the title's resource (null if none) and
     /// the FidelityFX state it is in.
     pub resources: [(*const Object, u32); 7],
+    /// The FidelityFX descriptions of those resources (type, format, sizes,
+    /// mips, flags, usage), for AMD's frame generation (`crate::framegen`).
+    pub descriptions: [[u32; 8]; 7],
     pub camera: plan::Camera,
     pub pre_exposure: f32,
     pub frame_ms: f32,
@@ -801,13 +804,16 @@ pub fn upscale(up: &Upscale) -> Taken {
     }
     let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
     let up = *up;
+    // The frame the title is making (its present of it comes next), for AMD's
+    // frame generation ([`crate::framegen`]).
+    let frame = crate::queue::presented() + 1;
     let asked = crate::list::external(
         up.list,
         Box::new(move |host| {
             if framegen {
                 note(host, &up, id);
             }
-            dlss && evaluate(host, &up, id)
+            dlss && evaluate(host, &up, id, frame)
         }),
     );
     if !asked {
@@ -918,7 +924,7 @@ pub(crate) fn submitted(id: u64) {
 
 /// DLSS in place of the title's upscaling, recorded into `host` (where the
 /// title's list is now). Whether it recorded anything.
-fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
+fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64, frame: u64) -> bool {
     let Some(plan) = PLAN.get() else { return false };
     let camera = up.camera;
     let fail = |why: &str| {
@@ -956,6 +962,40 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         Err(why) => return fail(&why),
     };
     crate::external::output_written(up.resources[OUTPUT].0);
+    // (vi-3080) AMD's frame generation prepares from the same depth and motion
+    // vectors, on the same list, right after DLSS.
+    if crate::framegen::requested()
+        && let (Some((depth, depth_state)), Some((motion, motion_state))) = (&textures[DEPTH], &textures[MOTION])
+        && depth.as_raw() != motion.as_raw()
+    {
+        // FidelityFX states: compute and pixel reads, or compute reads.
+        let read = |state: u32| if state & 0xc0 == 0xc0 { 0xc } else { 0x4 };
+        let prepared = crate::framegen::prepare(
+            &host.list,
+            frame,
+            id,
+            crate::framegen::Inputs {
+                depth,
+                motion,
+                depth_desc: up.descriptions[DEPTH],
+                motion_desc: up.descriptions[MOTION],
+                depth_state: read(*depth_state),
+                motion_state: read(*motion_state),
+                max_render: camera.output,
+                render_size: camera.render,
+                upscale_flags: camera.flags,
+                jitter: camera.jitter,
+                motion_scale: camera.motion_scale,
+                frame_ms: up.frame_ms,
+                reset: camera.reset,
+                camera: [camera.near, camera.far, camera.fov_y, 1.0],
+            },
+        );
+        if let Some(preparation) = prepared {
+            host.vi_keep(Box::new(preparation));
+            host.mark_upscale(id);
+        }
+    }
     EVALUATED.fetch_add(1, Relaxed);
     let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;
     if all == 1 || recorded.changed {
@@ -1321,6 +1361,28 @@ fn hudless_for(shown: &ID3D12Resource) -> Option<ID3D12Resource> {
     let first = submitted.iter().position(|c| c.target == shown).map(|i| submitted.remove(i));
     submitted.retain(|c| c.target != shown);
     first.map(|c| c.texture)
+}
+
+/// (vi-3080) AMD's frame generation runs on our swap chain (`crate::framegen`):
+/// the colour without the interface is copied as for DLSS Frame Generation
+/// (`VICTORY_FRAMEGEN_HUDLESS=0`: not), for AMD to find the interface by.
+pub(crate) fn fsr_hudless_wanted() {
+    let wanted = std::env::var_os("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v != "0");
+    HUDLESS_WANTED.store(wanted, Release);
+    if wanted {
+        tracing::info!("frame generation (FSR): the colour without the interface is copied in front of the title's interface composite, for AMD to keep the interface out of generated frames");
+    }
+}
+
+/// (vi-3080) At a present of `shown` with AMD's frame generation: the copy
+/// of it taken in front of the interface composite since its last present.
+pub(crate) fn fsr_hudless(shown: &ID3D12Resource) -> Option<ID3D12Resource> {
+    if !hudless_wanted() {
+        return None;
+    }
+    let copy = hudless_for(shown);
+    HUD_COUNTS[if copy.is_some() { HUD_TAGGED } else { HUD_MISSING }].fetch_add(1, Relaxed);
+    copy
 }
 
 /// The planes a present shows (Series S: the scene and the interface over

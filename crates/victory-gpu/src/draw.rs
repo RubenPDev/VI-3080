@@ -1788,6 +1788,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        vi_bind::resume();
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1830,6 +1831,7 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        vi_bind::to(vi_bind::VERTEX);
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -1854,6 +1856,8 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        vi_bind::to(vi_bind::TARGETS);
+        vi_bind::stop();
         true
     }
 
@@ -1866,8 +1870,10 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let vi_began = vi_bind::start();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        vi_bind::to(vi_bind::EARLY);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1971,6 +1977,7 @@ impl State {
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
+            vi_bind::to(vi_bind::T_DONE);
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
@@ -1987,6 +1994,7 @@ impl State {
             } else {
                 None
             };
+            vi_bind::to(vi_bind::MEMORY);
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -2026,6 +2034,7 @@ impl State {
                     }
                 }
             }
+            vi_bind::to(vi_bind::USER);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -2123,6 +2132,7 @@ impl State {
                     }
                 }
             }
+            vi_bind::to(vi_bind::VIEWS);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -2150,10 +2160,13 @@ impl State {
                     return false;
                 }
             }
+            vi_bind::to(vi_bind::UAVS);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        vi_bind::to(vi_bind::REST);
+        vi_bind::done(vi_began);
         true
     }
 
@@ -4426,6 +4439,7 @@ impl State {
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        vi_bind::to(vi_bind::SETUP);
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -4448,6 +4462,8 @@ impl State {
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
+        vi_bind::count(vi_bind::DIRECT, plan.direct.len() as u64);
+        vi_bind::to(vi_bind::T_CHECK);
         let mut made = Few::default();
         for group in &plan.groups {
             let slot = group.slot;
@@ -4503,6 +4519,7 @@ impl State {
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            vi_bind::to(vi_bind::T_KEY);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -4516,6 +4533,8 @@ impl State {
                         TESTED_DEPTH.set((reader.3, true));
                     }
                     made.push((slot, first * 32));
+                    vi_bind::count(vi_bind::REUSED, 1);
+                    vi_bind::to(vi_bind::T_KNOWN);
                     continue;
                 }
                 let depth_before = TESTED_DEPTH.get();
@@ -4552,6 +4571,8 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                vi_bind::count(vi_bind::AGAIN, 1);
+                vi_bind::to(vi_bind::T_KNOWN);
                 continue;
             }
             let Some(first) = host.dynamic(n).or_else(|| {
@@ -4563,6 +4584,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
+            vi_bind::to(vi_bind::T_SLOTS);
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
@@ -4678,6 +4700,9 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+            vi_bind::count(vi_bind::NEW, 1);
+            vi_bind::count(vi_bind::SLOTS_MADE, u64::from(n));
+            vi_bind::to(vi_bind::T_MAKE);
         }
         made
     }
@@ -5062,9 +5087,26 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
+        shape: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        // (vi-3080) Timed by step for the frame line ([`indirect_steps_line`]);
+        // counted as work for the barriers ([`HostList::vi_barrier_redundant`]).
+        list.vi_indirect_called();
+        let mut clock = IndirectClock::new();
+        let ran = self.execute_indirect_timed(list, shape, arguments, count, &mut clock);
+        clock.finish();
+        ran
+    }
+
+    fn execute_indirect_timed(
+        &mut self,
+        list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        clock: &mut IndirectClock,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
@@ -5144,10 +5186,14 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        clock.mark(STEP_LOOK);
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            clock.mark(STEP_REFRESH);
+            let batched = self.batched(list, &args, arguments, kind);
+            clock.mark(STEP_CLAMP);
+            batched
         } else {
             None
         };
@@ -5207,6 +5253,7 @@ impl State {
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                clock.mark(STEP_REFRESH);
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0. What is held back runs before it.
@@ -5219,6 +5266,7 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                clock.mark(STEP_CLAMP);
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -5286,6 +5334,7 @@ impl State {
             joined
         };
         merge::count(verdict, joined);
+        clock.mark(STEP_MERGE);
         if !joined {
             let ran = match kind {
                 DRAW | INDEXED => self.prepare(list, kind == INDEXED),
@@ -5293,6 +5342,7 @@ impl State {
                 DISPATCH => self.bind(list, p, true),
                 _ => false,
             };
+            clock.mark(STEP_BIND);
             if !ran {
                 why("prepare failed");
                 return false;
@@ -5367,6 +5417,258 @@ impl State {
         }
         true
     }
+}
+
+/// (vi-3080) The steps of an indirect execution, timed: finding what it
+/// needs (pipeline, copies, signature), refreshing the arguments' host copy,
+/// the clamp pass (or its batch), joining it to the run before, binding the
+/// state, and the rest (the host's call, the ambient stand-in, notes).
+const STEP_LOOK: usize = 0;
+const STEP_REFRESH: usize = 1;
+const STEP_CLAMP: usize = 2;
+const STEP_MERGE: usize = 3;
+const STEP_BIND: usize = 4;
+const STEP_REST: usize = 5;
+const STEPS: usize = 6;
+/// A call this long or longer (microseconds) is a slow one.
+const SLOW_US: u64 = 50;
+
+/// Since the last frame line: nanoseconds by step, of all calls; the same of
+/// slow calls; then calls, slow calls.
+static INDIRECT_NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+static INDIRECT_SLOW_NS: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+static INDIRECT_CALLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+struct IndirectClock {
+    last: std::time::Instant,
+    parts: [u64; STEPS],
+}
+
+impl IndirectClock {
+    fn new() -> Self {
+        Self { last: std::time::Instant::now(), parts: [0; STEPS] }
+    }
+
+    /// What passed since the last mark goes to `step`.
+    fn mark(&mut self, step: usize) {
+        let now = std::time::Instant::now();
+        self.parts[step] += now.duration_since(self.last).as_nanos() as u64;
+        self.last = now;
+    }
+
+    fn finish(mut self) {
+        self.mark(STEP_REST);
+        let all: u64 = self.parts.iter().sum();
+        let slow = all >= SLOW_US * 1000;
+        INDIRECT_CALLS[0].fetch_add(1, Ordering::Relaxed);
+        if slow {
+            INDIRECT_CALLS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        for (i, &ns) in self.parts.iter().enumerate() {
+            INDIRECT_NS[i].fetch_add(ns, Ordering::Relaxed);
+            if slow {
+                INDIRECT_SLOW_NS[i].fetch_add(ns, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// (vi-3080) The parts of binding a draw or dispatch, timed on each thread
+/// and summed now and then: [`State::bind`], its descriptor tables
+/// ([`State::tables`]) and what [`State::prepare_for`] does after it.
+pub(crate) mod vi_bind {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Textures picked by index ahead of the draw.
+    pub(super) const EARLY: usize = 0;
+    /// Heaps, root signature and pipeline set.
+    pub(super) const SETUP: usize = 1;
+    /// Tables: which need making, and the entries read directly.
+    pub(super) const T_CHECK: usize = 2;
+    /// Tables: the entries indexed, the hash of the table and its lookup.
+    pub(super) const T_KEY: usize = 3;
+    /// Tables made before in the list: brought up to date or left.
+    pub(super) const T_KNOWN: usize = 4;
+    /// Tables: dynamic slots asked for.
+    pub(super) const T_SLOTS: usize = 5;
+    /// Tables: made in the dynamic slots, slot by slot.
+    pub(super) const T_MAKE: usize = 6;
+    /// Tables: what is left after the last one.
+    pub(super) const T_DONE: usize = 7;
+    /// Title memory by address made ready.
+    pub(super) const MEMORY: usize = 8;
+    /// User data (root constants).
+    pub(super) const USER: usize = 9;
+    /// Root constant and shader resource views.
+    pub(super) const VIEWS: usize = 10;
+    /// Root unordered access views.
+    pub(super) const UAVS: usize = 11;
+    /// The rest of binding.
+    pub(super) const REST: usize = 12;
+    /// After binding a draw: vertex and index buffers.
+    pub(super) const VERTEX: usize = 13;
+    /// After binding a draw: render target and depth states.
+    pub(super) const TARGETS: usize = 14;
+    const PARTS: usize = 15;
+
+    pub(super) const BINDS: usize = 0;
+    pub(super) const SLOW: usize = 1;
+    pub(super) const REUSED: usize = 2;
+    pub(super) const AGAIN: usize = 3;
+    pub(super) const NEW: usize = 4;
+    pub(super) const SLOTS_MADE: usize = 5;
+    pub(super) const DIRECT: usize = 6;
+    const SLOW_NS: usize = 7;
+    const COUNTS: usize = 8;
+
+    /// A bind of this many microseconds or more is a slow one.
+    const SLOW_US: u64 = 50;
+
+    thread_local! {
+        static NS: Cell<[u64; PARTS]> = const { Cell::new([0; PARTS]) };
+        static N: Cell<[u64; COUNTS]> = const { Cell::new([0; COUNTS]) };
+        static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    static SUM_NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+    static SUM_N: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
+
+    /// A bind begins now.
+    pub(super) fn start() -> Instant {
+        let now = Instant::now();
+        LAST.set(Some(now));
+        now
+    }
+
+    /// Timing goes on from now (after a bind, for the rest of a draw).
+    pub(super) fn resume() {
+        LAST.set(Some(Instant::now()));
+    }
+
+    /// Timing stops until the next bind.
+    pub(super) fn stop() {
+        LAST.set(None);
+    }
+
+    /// What passed since the last mark goes to `part` (nothing outside a
+    /// bind).
+    pub(super) fn to(part: usize) {
+        let Some(last) = LAST.get() else { return };
+        let now = Instant::now();
+        LAST.set(Some(now));
+        let ns = now.duration_since(last).as_nanos() as u64;
+        NS.set({
+            let mut a = NS.get();
+            a[part] += ns;
+            a
+        });
+    }
+
+    pub(super) fn count(what: usize, n: u64) {
+        N.set({
+            let mut a = N.get();
+            a[what] += n;
+            a
+        });
+    }
+
+    /// A bind that began at `began` is done: counted, and every 64 binds
+    /// the thread's sums go to the shared ones.
+    pub(super) fn done(began: Instant) {
+        let ns = began.elapsed().as_nanos() as u64;
+        let mut n = N.get();
+        n[BINDS] += 1;
+        if ns >= SLOW_US * 1000 {
+            n[SLOW] += 1;
+            n[SLOW_NS] += ns;
+        }
+        if n[BINDS] < 64 {
+            N.set(n);
+            return;
+        }
+        for (sum, v) in SUM_N.iter().zip(n) {
+            sum.fetch_add(v, Ordering::Relaxed);
+        }
+        N.set([0; COUNTS]);
+        for (sum, v) in SUM_NS.iter().zip(NS.get()) {
+            sum.fetch_add(v, Ordering::Relaxed);
+        }
+        NS.set([0; PARTS]);
+    }
+
+    /// For the frame line, per frame of the last `frames`.
+    pub(crate) fn line(frames: f64) {
+        let ms: [f64; PARTS] = std::array::from_fn(|i| SUM_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+        let n: [f64; COUNTS] = std::array::from_fn(|i| SUM_N[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if n[BINDS] == 0.0 {
+            return;
+        }
+        tracing::info!(
+            "vi-3080 binding per frame (all threads): {:.0} binds {:.1} ms, {:.0} of {SLOW_US} us or more {:.1} ms; \
+             textures picked by index ahead {:.1}, heaps and pipeline {:.1}; tables: which to make and direct entries \
+             {:.1} ({:.0} entries), indexed entries and hash {:.1}, known ones {:.1} ({:.0} left as they were, {:.0} \
+             brought up to date again), slots asked {:.1}, made {:.1} ({:.0} tables of {:.0} slots), after the last \
+             {:.1}; title memory by address {:.1}, user data {:.1}, root views {:.1}, root unordered views {:.1}, the \
+             rest {:.1}; for draws after it: vertex and index buffers {:.1}, target states {:.1}",
+            n[BINDS],
+            ms.iter().sum::<f64>(),
+            n[SLOW],
+            n[SLOW_NS] / 1e6,
+            ms[EARLY],
+            ms[SETUP],
+            ms[T_CHECK],
+            n[DIRECT],
+            ms[T_KEY],
+            ms[T_KNOWN],
+            n[REUSED],
+            n[AGAIN],
+            ms[T_SLOTS],
+            ms[T_MAKE],
+            n[NEW],
+            n[SLOTS_MADE],
+            ms[T_DONE],
+            ms[MEMORY],
+            ms[USER],
+            ms[VIEWS],
+            ms[UAVS],
+            ms[REST],
+            ms[VERTEX],
+            ms[TARGETS],
+        );
+    }
+}
+
+/// (vi-3080) For the frame line: the indirect executions' time by step, per
+/// frame of the last `frames`.
+pub(crate) fn indirect_steps_line(frames: f64) {
+    let ms = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+    let all: [f64; STEPS] = std::array::from_fn(|i| ms(&INDIRECT_NS[i]));
+    let slow: [f64; STEPS] = std::array::from_fn(|i| ms(&INDIRECT_SLOW_NS[i]));
+    let calls = INDIRECT_CALLS[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let slow_calls = INDIRECT_CALLS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+    if calls == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "vi-3080 indirect steps per frame: {calls:.0} calls {:.1} ms (looking up {:.1}, refreshing arguments {:.1}, \
+         clamp pass {:.1}, joining {:.1}, binding {:.1}, the rest {:.1}); of them {slow_calls:.1} of {SLOW_US} us or more \
+         {:.1} ms (looking up {:.1}, refreshing arguments {:.1}, clamp pass {:.1}, joining {:.1}, binding {:.1}, the rest {:.1})",
+        all.iter().sum::<f64>(),
+        all[STEP_LOOK],
+        all[STEP_REFRESH],
+        all[STEP_CLAMP],
+        all[STEP_MERGE],
+        all[STEP_BIND],
+        all[STEP_REST],
+        slow.iter().sum::<f64>(),
+        slow[STEP_LOOK],
+        slow[STEP_REFRESH],
+        slow[STEP_CLAMP],
+        slow[STEP_MERGE],
+        slow[STEP_BIND],
+        slow[STEP_REST],
+    );
 }
 
 /// Before something is recorded into `list` for an indirect execution (a

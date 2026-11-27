@@ -1481,6 +1481,16 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    // (vi-3080) A resource no view names (most buffers) leaves the views as
+    // they are: asked under the read lock, which the translating threads
+    // share, instead of the write lock, which stops them all. Every release
+    // of the title's took the write lock, and the other threads waited
+    // about 1.9 s of every 5 s for the views' lock in gameplay (the pass
+    // over textures' line, profile 12).
+    let named = views_read().by_resource.contains_key(&resource);
+    if !named {
+        return;
+    }
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;

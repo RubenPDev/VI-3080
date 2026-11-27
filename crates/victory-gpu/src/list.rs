@@ -1631,6 +1631,10 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// `State::synced`.)
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
+    if vi_barrier_skipped(this) {
+        return;
+    }
+    #[cfg(windows)]
     {
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
@@ -1657,9 +1661,39 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
+            list.vi_barrier_recorded();
         }
     }
     let _ = (this, flags, control, address, size);
+}
+
+/// (vi-3080) Barriers on every shader write since the last frame line:
+/// recorded, and left out for following the one before with nothing recorded
+/// between them ([`crate::host::HostList::vi_barrier_redundant`]).
+#[cfg(windows)]
+static VI_BARRIERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// (vi-3080) Whether the title's barrier or pipeline sync at this place of
+/// `this` is left out (counted either way).
+#[cfg(windows)]
+fn vi_barrier_skipped(this: This) -> bool {
+    let skip = host_list_held(this).is_some_and(|list| list.vi_barrier_redundant());
+    VI_BARRIERS[usize::from(skip)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    skip
+}
+
+/// (vi-3080) For the frame line, per frame of the last `frames`.
+#[cfg(windows)]
+pub(crate) fn vi_barrier_line(frames: f64) {
+    let [kept, left] = [0, 1].map(|i| VI_BARRIERS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if kept + left > 0.0 {
+        tracing::info!(
+            "vi-3080 barriers on every shader write per frame: {:.0} recorded, {:.0} left out for following the one \
+             before with nothing recorded between them (VICTORY_BARRIER_ELIDE=0 records them all)",
+            kept,
+            left
+        );
+    }
 }
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
@@ -2208,6 +2242,10 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    if count > 0 && vi_barrier_skipped(this) {
+        return;
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2226,6 +2264,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.vi_barrier_recorded();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

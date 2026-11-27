@@ -96,7 +96,17 @@ fn get(var: &str) -> String {
 /// Whether a change of `item` shows at once. Frame generation does when this run started with
 /// it ready (the launcher asks for that whenever Streamline is there).
 fn live(item: &Item) -> bool {
-    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && (crate::streamline::framegen_live() || crate::framegen::requested()))
+}
+
+/// (vi-3080) The frame generation item stands for AMD's (`crate::framegen`)
+/// when this run has it: on ("2") or off ("0"), as F6 leaves it.
+fn fsr_item(item: &Item) -> bool {
+    item.var == "VICTORY_MENU_FRAMEGEN" && crate::framegen::requested()
+}
+
+fn fsr_value() -> String {
+    if crate::framegen::switched_on() { "2" } else { "0" }.to_owned()
 }
 
 /// Whether the frame-rate line is shown at the top while the menu is closed
@@ -118,6 +128,9 @@ fn fps_line() -> Option<String> {
     let fps = f64::from(super::METER_FPS_TENTHS.load(Ordering::Relaxed)) / 10.0;
     if fps <= 0.0 {
         return None;
+    }
+    if let Some(shown) = crate::framegen::shown_fps() {
+        return Some(format!("FPS: {fps:.1}  FG: {shown:.1}"));
     }
     Some(match crate::streamline::shown_per_frame() {
         1 => format!("FPS: {fps:.1}"),
@@ -274,7 +287,7 @@ impl Menu {
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
-        let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
+        let values: Vec<String> = ITEMS.iter().map(|i| if fsr_item(i) { fsr_value() } else { get(i.var) }).collect();
         Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
     }
 
@@ -293,8 +306,14 @@ impl Menu {
         for row in first..(first + ROWS).min(total) {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
-                let value = &self.values[row];
-                let shown = index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned());
+                let fsr = fsr_item(item);
+                let current = if fsr { fsr_value() } else { self.values[row].clone() };
+                let value = &current;
+                let shown = if fsr {
+                    if value == "0" { "OFF (AMD FSR, F6)".to_owned() } else { "ON (AMD FSR, F6)".to_owned() }
+                } else {
+                    index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned())
+                };
                 let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
                 format!("{cursor} {:<27} < {shown} >{mark}", item.label)
             } else {
@@ -313,6 +332,13 @@ impl Menu {
     /// Changes item `i` by `step` (+1 / -1) through its values.
     fn change(&mut self, i: usize, step: isize) {
         let item = &ITEMS[i];
+        if fsr_item(item) {
+            // AMD's: on or off, at once.
+            self.values[i] = if crate::framegen::switched_on() { "0" } else { "2" }.to_owned();
+            self.apply_live(i);
+            self.note.clear();
+            return;
+        }
         let n = item.values.len() as isize;
         let now = index_of(item, &self.values[i]).map_or(-1, |x| x as isize);
         let next = if now < 0 { if step > 0 { 0 } else { n - 1 } } else { (now + step).rem_euclid(n) };
@@ -338,6 +364,7 @@ impl Menu {
         }
         match var {
             // Off (0) or the frames shown for each one rendered, from the next present on.
+            "VICTORY_MENU_FRAMEGEN" if crate::framegen::requested() => crate::framegen::set_switched(value != "0"),
             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
             "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
@@ -351,6 +378,12 @@ impl Menu {
             self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
             return false;
         };
+        // (F6 may have switched AMD's frame generation since.)
+        for (i, item) in ITEMS.iter().enumerate() {
+            if fsr_item(item) {
+                self.values[i] = fsr_value();
+            }
+        }
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
             .unwrap_or_default()
             .lines()

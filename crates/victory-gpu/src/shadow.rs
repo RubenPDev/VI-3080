@@ -563,9 +563,12 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
+    // (vi-3080) Up to `VICTORY_WINDOW_ROOM_PERCENT` of the budget, as windows
+    // with two sides ([`window_room_for`]).
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * vi_window_room_percent()
     {
+        vi_window_note(VI_WINDOW_FULL, size);
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -575,6 +578,9 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        vi_window_note(VI_WINDOW_FAILED, size);
+    } else {
+        vi_window_note(VI_WINDOW_BAR, size);
     }
     made
 }
@@ -597,22 +603,115 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     let host = host()?;
     if !host.card_ready() {
+        vi_window_note(VI_WINDOW_NOT_READY, size);
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * vi_window_room_percent()
     {
+        vi_window_note(VI_WINDOW_FULL, size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        vi_window_note(VI_WINDOW_CAP, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        vi_window_note(VI_WINDOW_FAILED, size);
+    } else {
+        vi_window_note(VI_WINDOW_PLACED, size);
     }
     buffer
+}
+
+/// (vi-3080) What became of the windows outside buffers asked to go to the
+/// card's memory ([`window_room_for`]), since the start: placed there, or
+/// left in the PC's memory (every draw then reads them over the bus) because
+/// the card was not ready yet, because it was over eight tenths of its
+/// budget, because the windows had their room already
+/// (`VICTORY_CARD_WINDOWS_MB`), or because the buffer was not made. Count,
+/// then bytes, for each.
+const VI_WINDOW_PLACED: usize = 0;
+const VI_WINDOW_NOT_READY: usize = 1;
+const VI_WINDOW_FULL: usize = 2;
+const VI_WINDOW_CAP: usize = 3;
+const VI_WINDOW_FAILED: usize = 4;
+/// Placed in card memory the CPU writes through the resizable BAR
+/// (`VICTORY_WINDOWS_BAR_MB`): no copy in the PC's memory, nothing sent up.
+const VI_WINDOW_BAR: usize = 5;
+static VI_WINDOWS: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
+
+/// (vi-3080) The share of the card's budget, in percent, up to which windows
+/// go to the card's memory (`VICTORY_WINDOW_ROOM_PERCENT`, 50 to 95; 80, as
+/// before, unless set). With the textures' line lower
+/// (`VICTORY_TEXTURE_ROOM_PERCENT`), the windows every draw reads from get the
+/// card's room before textures do.
+fn vi_window_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let percent = std::env::var("VICTORY_WINDOW_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 95));
+        tracing::info!(percent, "windows go to the card up to this share of its budget (VICTORY_WINDOW_ROOM_PERCENT)");
+        percent
+    })
+}
+
+fn vi_window_note(what: usize, size: u64) {
+    VI_WINDOWS[what][0].fetch_add(1, Ordering::Relaxed);
+    VI_WINDOWS[what][1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// (vi-3080) For the frame line: [`VI_WINDOWS`] and the card's memory, said
+/// when the windows' counts changed since it was said last, or every 30th
+/// time.
+pub(crate) fn vi_window_line() {
+    static SAID: std::sync::Mutex<([u64; 6], u64)> = std::sync::Mutex::new(([0; 6], 0));
+    let counts: [u64; 6] = std::array::from_fn(|i| VI_WINDOWS[i][0].load(Ordering::Relaxed));
+    let mb: [u64; 6] = std::array::from_fn(|i| VI_WINDOWS[i][1].load(Ordering::Relaxed) >> 20);
+    {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        said.1 += 1;
+        if said.0 == counts && !said.1.is_multiple_of(30) {
+            return;
+        }
+        said.0 = counts;
+    }
+    if counts.iter().all(|&n| n == 0) {
+        return;
+    }
+    let memory = host().and_then(|h| h.video_memory());
+    let (budget, used) = memory.map_or((0, 0), |m| (m[0] >> 20, m[1] >> 20));
+    tracing::info!(
+        "vi-3080 windows of title memory on the card since the start: {} placed through the BAR ({} MB, {} MB alive); {} placed \
+         ({} MB, {} MB alive of at most {} MB); left in the \
+         PC's memory, read over the bus: {} with the card over {}% of its budget ({} MB), {} past the windows' room \
+         ({} MB), {} before the card was ready ({} MB), {} not made ({} MB); title buffers without a card copy for room: {} ({} MB), \
+         card copies {} MB; the card: {used} MB in use of a budget of {budget} MB",
+        counts[VI_WINDOW_BAR],
+        mb[VI_WINDOW_BAR],
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) >> 20,
+        counts[VI_WINDOW_PLACED],
+        mb[VI_WINDOW_PLACED],
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20,
+        window_card_most() >> 20,
+        counts[VI_WINDOW_FULL],
+        vi_window_room_percent(),
+        mb[VI_WINDOW_FULL],
+        counts[VI_WINDOW_CAP],
+        mb[VI_WINDOW_CAP],
+        counts[VI_WINDOW_NOT_READY],
+        mb[VI_WINDOW_NOT_READY],
+        counts[VI_WINDOW_FAILED],
+        mb[VI_WINDOW_FAILED],
+        CARD_REFUSED[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed) >> 20,
+        CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+    );
 }
 
 /// What went up, by send: its number, and the offsets, in order and joined

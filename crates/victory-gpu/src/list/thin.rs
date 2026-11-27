@@ -144,6 +144,7 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
+            recording.vi_times[0].store(vi_now(), Relaxed);
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
@@ -155,6 +156,9 @@ impl Front {
         }
         self.put(CLOSE, &[]);
         self.closed = true;
+        if let Some(recording) = &self.recording {
+            recording.vi_times[1].store(vi_now(), Relaxed);
+        }
         self.hand_over();
     }
 }
@@ -172,6 +176,18 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// (vi-3080) Since the last line: nanoseconds recordings waited in [`READY`]
+/// for a thread, the longest such wait, and the waits; nanoseconds from the
+/// title's close of a list to the end of its translation, the longest, and
+/// the lists; the longest translation of one list (all its pieces).
+static VI_LAG: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// (vi-3080) Nanoseconds since the first call, plus one.
+fn vi_now() -> u64 {
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64 + 1
+}
+
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -180,6 +196,9 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// yet, and the list of ours it goes to.
 pub(crate) struct Recording {
     kind: u32,
+    /// (vi-3080) When it last went into [`READY`], when the title closed it
+    /// ([`vi_now`]; 0: not yet), and the nanoseconds spent translating it.
+    vi_times: [AtomicU64; 3],
     inner: Mutex<Inner>,
     /// Translated to its end.
     done: AtomicBool,
@@ -204,6 +223,7 @@ impl Recording {
     fn new(kind: u32) -> Self {
         Recording {
             kind,
+            vi_times: [const { AtomicU64::new(0) }; 3],
             inner: Mutex::default(),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
@@ -246,6 +266,17 @@ impl Recording {
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            let spent = self.vi_times[2].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+            if closed {
+                let closed_at = self.vi_times[1].load(Relaxed);
+                if closed_at != 0 {
+                    let lag = vi_now().saturating_sub(closed_at);
+                    VI_LAG[3].fetch_add(lag, Relaxed);
+                    VI_LAG[4].fetch_max(lag, Relaxed);
+                    VI_LAG[5].fetch_add(1, Relaxed);
+                }
+                VI_LAG[6].fetch_max(spent + began.elapsed().as_nanos() as u64, Relaxed);
+            }
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {
@@ -315,6 +346,13 @@ fn start() {
                         }
                     }
                 };
+                let queued = recording.vi_times[0].load(Relaxed);
+                if queued != 0 {
+                    let waited = vi_now().saturating_sub(queued);
+                    VI_LAG[0].fetch_add(waited, Relaxed);
+                    VI_LAG[1].fetch_max(waited, Relaxed);
+                    VI_LAG[2].fetch_add(1, Relaxed);
+                }
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }
@@ -356,6 +394,20 @@ pub(crate) fn line(frames: f64) {
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
+    );
+    let v: [u64; 7] = std::array::from_fn(|i| VI_LAG[i].swap(0, Relaxed));
+    let ms = |ns: u64| ns as f64 / 1e6;
+    tracing::info!(
+        "vi-3080 translation per frame: lists waited for a thread {:.1} ms in {:.0} waits (the longest {:.1} ms); \
+         a list's translation ended {:.1} ms after the title closed it on average, the longest {:.1} ms (of {:.0} \
+         lists); the longest list took {:.1} ms to translate",
+        ms(v[0]) / frames,
+        v[2] as f64 / frames,
+        ms(v[1]),
+        if v[5] > 0 { ms(v[3]) / v[5] as f64 } else { 0.0 },
+        ms(v[4]),
+        v[5] as f64 / frames,
+        ms(v[6]),
     );
 }
 

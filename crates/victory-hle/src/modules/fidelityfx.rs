@@ -374,6 +374,7 @@ fn upscale(d: &DispatchUpscale, created: &Created, context: usize) -> Upscale {
         context,
         list: d.list.cast::<Object>().cast_const(),
         resources: d.resources.map(|r| (r.resource.cast::<Object>().cast_const(), r.state)),
+        descriptions: d.resources.map(|r| r.description),
         camera: Camera {
             jitter: d.jitter,
             motion_scale: d.motion_scale,

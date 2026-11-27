@@ -908,7 +908,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// (vi-3080: in every build, for AMD's frame generation.)
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

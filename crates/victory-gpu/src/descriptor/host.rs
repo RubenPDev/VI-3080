@@ -2203,6 +2203,51 @@ impl Drop for QueueGuard<'_> {
     }
 }
 
+/// (vi-3080) The first of `n` consecutive free slots (false) lying wholly in
+/// `taken[from..to]`: the earliest such run, as the slot-by-slot search of
+/// [`HostHeap::dynamic`] found it.
+fn free_run(taken: &[bool], from: usize, to: usize, n: usize) -> Option<usize> {
+    let to = to.min(taken.len());
+    if n == 0 || from >= to {
+        return None;
+    }
+    // SAFETY: a bool is one byte, 0 or 1.
+    let bytes = unsafe { std::slice::from_raw_parts(taken.as_ptr().cast::<u8>(), taken.len()) };
+    let mut at = from;
+    loop {
+        at = first_byte(bytes, at, to, 0);
+        if at + n > to {
+            return None;
+        }
+        let busy = first_byte(bytes, at, at + n, 1);
+        if busy == at + n {
+            return Some(at);
+        }
+        at = busy + 1;
+    }
+}
+
+/// The first index in `bytes[from..to]` that holds `want` (0 or 1, as every
+/// byte there does), or `to`.
+#[inline]
+fn first_byte(bytes: &[u8], from: usize, to: usize, want: u8) -> usize {
+    // Eight bytes that all hold the other value.
+    let other = if want == 0 { u64::from_ne_bytes([1; 8]) } else { 0 };
+    let mut at = from;
+    while at + 8 <= to {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[at..at + 8]);
+        if u64::from_ne_bytes(word) != other {
+            break;
+        }
+        at += 8;
+    }
+    while at < to && bytes[at] != want {
+        at += 1;
+    }
+    at
+}
+
 impl HostHeap {
     /// The queue of textures picked by index, locked by place `site`
     /// (`super::queue_site`); the lock taken, a wait for it, and how long
@@ -2256,22 +2301,17 @@ impl HostHeap {
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        // (vi-3080) The same search, eight slots at a time over stretches
+        // that are all taken or all free ([`free_run`]): slot by slot it
+        // walked the taken stretches of a nearly full ring, under the lock
+        // every translating thread needs (the frame line's "slots asked":
+        // 52 ms a frame of the threads' time for 24,753 tables).
+        let slots: &[bool] = taken;
+        let found = if enough {
+            free_run(slots, cursor, end, n).or_else(|| free_run(slots, 0, second_end, n))
+        } else {
+            None
+        };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -5089,17 +5129,30 @@ fn make_twinned(
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+    fn shift(most: &mut u32, mips: &mut u32, min_lod: &mut f32, base: u32) {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if *mips != u32::MAX {
+            *mips = mips.saturating_sub(lost).max(1);
+        }
+        *min_lod = (*min_lod - base as f32).max(0.0);
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, base);
+        }
+        // (vi-3080) An array view of a one-layer texture: the texture cap
+        // gives far more copies a later first level than held levels did
+        // (after KLBF fccf50f's `capped_srv`).
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, base);
+        }
+        _ => {}
     }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -6769,6 +6822,24 @@ mod tests {
         );
         a.release(a.id(), first, 2);
         assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), after_alloc + 2);
+    }
+
+    #[test]
+    fn free_runs_are_found_eight_slots_at_a_time_as_one_by_one() {
+        let ring: Vec<bool> = (0..300).map(|i| i % 7 == 0 || (40..90).contains(&i) || (i * 31) % 11 == 3).collect();
+        let slow = |from: usize, to: usize, n: usize| {
+            (from..to).find(|&at| at + n <= to && ring[at..at + n].iter().all(|t| !t))
+        };
+        for n in 1..12 {
+            for from in [0, 1, 5, 39, 41, 89, 90, 200] {
+                for to in [from, from + 1, 100, 299, 300] {
+                    assert_eq!(super::free_run(&ring, from, to, n), slow(from, to.min(300), n), "n {n} from {from} to {to}");
+                }
+            }
+        }
+        assert_eq!(super::free_run(&[true; 64], 0, 64, 1), None);
+        assert_eq!(super::free_run(&[false; 64], 3, 64, 61), Some(3));
+        assert_eq!(super::free_run(&[false; 64], 3, 64, 62), None);
     }
 
     #[test]

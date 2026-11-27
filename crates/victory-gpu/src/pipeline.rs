@@ -151,7 +151,10 @@ impl Shader {
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                // (vi-3080) `VICTORY_SHADER_SAVE_ONLY=<hash>,<hash>...`: only those.
+                let wanted = std::env::var("VICTORY_SHADER_SAVE_ONLY")
+                    .map_or(true, |only| only.split(',').any(|h| h.trim().eq_ignore_ascii_case(&self.hash)));
+                if wanted && let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
